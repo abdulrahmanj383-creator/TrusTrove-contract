@@ -1,4 +1,9 @@
-use soroban_sdk::{Address, Env, Symbol};
+use soroban_sdk::{Address, BytesN, Env, Symbol};
+
+pub fn upgraded(env: &Env, wasm_hash: &BytesN<32>) {
+    env.events()
+        .publish((Symbol::new(env, "upgraded"), wasm_hash.clone()), ());
+}
 
 pub fn contract_initialized(env: &Env, admin: &Address) {
     env.events().publish(
@@ -74,4 +79,19 @@ pub fn paused(env: &Env, admin: &Address) {
 pub fn unpaused(env: &Env, admin: &Address) {
     env.events()
         .publish((Symbol::new(env, "unpaused"), admin.clone()), ());
+}
+
+/// Emitted by `set_verifier` when the admin assigns (or replaces) the
+/// verifier role. `admin` is indexed; the data is the new verifier address.
+pub fn verifier_set(env: &Env, admin: &Address, verifier: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "verifier_set"), admin.clone()),
+        verifier.clone(),
+    );
+}
+
+/// Emitted by `remove_verifier` when the admin clears the verifier role.
+pub fn verifier_removed(env: &Env, admin: &Address) {
+    env.events()
+        .publish((Symbol::new(env, "verifier_removed"), admin.clone()), ());
 }

@@ -1,11 +1,12 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, panic_with_error, token, Address, BytesN, Env, IntoVal, String, Symbol,
-    Vec,
+    contract, contractimpl, contracttype, panic_with_error, token, Address, BytesN, Env, IntoVal,
+    String, Symbol, Vec,
 };
 use trusttrove_pause::{require_not_paused, set_paused};
 
+mod bench;
 mod constants;
 mod errors;
 mod events;
@@ -22,6 +23,37 @@ pub use types::*;
 /// the default: `totals()`'s fallback reads the same constant, so the two call
 /// sites can never silently desync if the default is ever changed.
 pub const DEFAULT_MAX_UTILIZATION_BPS: u32 = 8500;
+
+/// Mirror of `InvoiceContract::FundingContext` (issue #833).
+///
+/// `fund_invoice` previously read `(status, face_value, discount_bps)`,
+/// `issuer`, `buyer` and `funding_asset` through four separate cross-contract
+/// calls into the invoice contract, each re-loading and deserializing the
+/// whole `Invoice`. The invoice now exposes the single
+/// `get_funding_context(invoice_id) -> FundingContext` view and this pool
+/// consumes it with one call.
+///
+/// The pool never imports the invoice crate in production code (WASM size
+/// budget, refs issue #309), so this is a wire-compatible mirror: identical
+/// struct name and field names/types, which is all the symbolic
+/// `#[contracttype]` map representation depends on. Keep it in sync with
+/// `contracts/invoice/src/lib.rs`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct FundingContext {
+    /// Invoice status discriminant; `1` means `Listed`.
+    pub status: u32,
+    /// Face value in USDC stroops.
+    pub face_value: u128,
+    /// Discount in basis points (1 bp = 0.01%).
+    pub discount_bps: u32,
+    /// Issuer address (paid the discounted proceeds by `escrow.lock`).
+    pub issuer: Address,
+    /// Buyer address (repayment obligor).
+    pub buyer: Address,
+    /// Funding asset address, checked against the pool's `funding_asset`.
+    pub funding_asset: Address,
+}
 
 #[contract]
 pub struct PoolContract;
@@ -356,6 +388,24 @@ impl PoolContract {
         Self::admin(&env).unwrap_or_else(|| panic_with_error!(&env, PoolError::NotInitialized))
     }
 
+    /// Replaces this contract's Wasm with an installed Wasm using the stored admin.
+    ///
+    /// The contract address and storage are preserved. Emits an `upgraded`
+    /// event carrying the new Wasm hash.
+    ///
+    /// # Panics
+    /// * `PoolError::NotInitialized` if no admin is stored.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        let admin =
+            Self::admin(&env).unwrap_or_else(|| panic_with_error!(&env, PoolError::NotInitialized));
+        admin.require_auth();
+
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        Self::extend_instance_ttl(&env);
+        events::upgraded(&env, &new_wasm_hash);
+    }
+
     /// Transfers pool admin ownership to `new_admin`.
     ///
     /// Uses the dual-authorization pattern shared with `RegistryContract` and
@@ -566,39 +616,8 @@ impl PoolContract {
         require_not_paused(&env);
         Self::require_initialized(&env);
         lp.require_auth();
-        if usdc_amount == 0 {
-            panic_with_error!(&env, PoolError::InvalidAmount);
-        }
-
-        let totals = Self::totals(&env);
-        let total_shares = totals.shares;
-        let total_deposits = totals.deposits;
-
-        if (total_shares == 0 || total_deposits == 0)
-            && usdc_amount < Self::min_initial_deposit(&env)
-        {
-            panic_with_error!(&env, PoolError::InvalidAmount);
-        }
-
-        let shares_to_issue = if total_shares == 0 || total_deposits == 0 {
-            usdc_amount
-        } else {
-            let scaled = usdc_amount
-                .checked_mul(total_shares)
-                .unwrap_or_else(|| panic_with_error!(&env, PoolError::Overflow));
-            scaled / total_deposits
-        };
-
-        // Dust-attack guard: once the pool accrues yield, the share price
-        // (total_deposits / total_shares) rises above 1.0, so a sufficiently
-        // small deposit can round down to 0 shares while its USDC is still
-        // pulled into total_deposits, silently donating the deposit to existing
-        // LPs. Reject any deposit that would mint 0 shares so the caller keeps
-        // their funds. This check runs before the token transfer, so no USDC
-        // leaves the depositor on the rejection path.
-        if shares_to_issue == 0 {
-            panic_with_error!(&env, PoolError::MinimumDeposit);
-        }
+        let shares_to_issue = Self::shares_for_deposit(&env, usdc_amount);
+        let total_deposits = Self::totals(&env).deposits;
 
         let usdc_id = Self::funding_asset(&env);
         let usdc = token::Client::new(&env, &usdc_id);
@@ -635,6 +654,70 @@ impl PoolContract {
         shares_to_issue
     }
 
+    /// Previews the number of pool shares a deposit would mint.
+    ///
+    /// Uses the same proportional calculation and rounding as `deposit`, and
+    /// only reads pool state. No authorization is required.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `usdc_amount` - The amount of USDC to deposit.
+    ///
+    /// # Auth
+    /// No authorization is required.
+    ///
+    /// # Panics
+    /// * `NotInitialized` if the pool is not initialized.
+    /// * `InvalidAmount` if `usdc_amount` is zero or is below the configured
+    ///   minimum for an initial deposit.
+    /// * `MinimumDeposit` if the amount rounds down to zero shares.
+    /// * `Overflow` if `usdc_amount * total_shares` overflows `u128`.
+    ///
+    /// # Returns
+    /// * `u128` - The number of shares `deposit` would issue.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let shares = client.preview_deposit(10_000_000);
+    /// ```
+    pub fn preview_deposit(env: Env, usdc_amount: u128) -> u128 {
+        Self::require_initialized(&env);
+        Self::shares_for_deposit(&env, usdc_amount)
+    }
+
+    /// Previews the USDC redemption amount for `shares` without requiring
+    /// authorization or changing contract state.
+    ///
+    /// The calculation and liquidity check match `withdraw`; this method does
+    /// not check an LP balance because it accepts no LP address.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `shares` - The number of pool shares to redeem.
+    ///
+    /// # Auth
+    /// No authorization is required.
+    ///
+    /// # Panics
+    /// * `NotInitialized` if the pool has not been initialized.
+    /// * `InvalidAmount` if `shares` is zero or the pool has no shares.
+    /// * `MinimumDeposit` if the redemption rounds down to zero.
+    /// * `InsufficientLiquidity` if available USDC is below the redemption
+    ///   amount.
+    /// * `Overflow` if `shares * total_deposits` overflows `u128`.
+    ///
+    /// # Returns
+    /// * `u128` - The USDC amount that `withdraw` would transfer for these
+    ///   shares, assuming the caller owns them.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let usdc = client.preview_withdraw(500);
+    /// ```
+    pub fn preview_withdraw(env: Env, shares: u128) -> u128 {
+        Self::require_initialized(&env);
+        Self::preview_withdraw_amount(&env, shares)
+    }
     /// Withdraws shares from the pool and transfers USDC to the LP.
     ///
     /// # Arguments
@@ -689,22 +772,8 @@ impl PoolContract {
             panic_with_error!(&env, PoolError::InsufficientShares);
         }
 
-        let totals = Self::totals(&env);
-        let total_shares = totals.shares;
-        let total_deposits = totals.deposits;
-        let total_funded = totals.funded;
-        let available = total_deposits - total_funded;
-
-        let scaled = shares
-            .checked_mul(total_deposits)
-            .unwrap_or_else(|| panic_with_error!(&env, PoolError::Overflow));
-        let usdc_to_return = scaled / total_shares;
-        if usdc_to_return == 0 {
-            panic_with_error!(&env, PoolError::MinimumDeposit);
-        }
-        if usdc_to_return > available {
-            panic_with_error!(&env, PoolError::InsufficientLiquidity);
-        }
+        let total_deposits = Self::totals(&env).deposits;
+        let usdc_to_return = Self::preview_withdraw_amount(&env, shares);
 
         let usdc_id = Self::funding_asset(&env);
         let usdc = token::Client::new(&env, &usdc_id);
@@ -1175,49 +1244,47 @@ impl PoolContract {
             panic_with_error!(&env, PoolError::AlreadyFunded);
         }
 
+        // Single batched read of every invoice field the funding path needs
+        // (status, face_value, discount_bps, issuer, buyer, funding_asset).
+        // This replaces four separate cross-contract calls —
+        // `get_funding_terms`, `get_issuer`, `get_buyer`, `get_funding_asset` —
+        // each of which loaded and deserialized the whole invoice
+        // independently (issue #833). The checks below run in exactly the
+        // order the four calls did, so error precedence is unchanged:
+        // a missing invoice still surfaces the invoice `NotFound` abort
+        // first, then `InvoiceNotListed`, `IssuerNotVerified`,
+        // `BuyerNotVerified`, `AssetMismatch` in that order.
         let mut args = Vec::new(&env);
         args.push_back(invoice_id.clone().into_val(&env));
-        let (invoice_status, face_value, discount_bps): (u32, u128, u32) = env.invoke_contract(
+        let ctx: FundingContext = env.invoke_contract(
             &invoice_contract,
-            &Symbol::new(&env, "get_funding_terms"),
+            &Symbol::new(&env, "get_funding_context"),
             args,
         );
-        if invoice_status != 1 {
+        if ctx.status != 1 {
             panic_with_error!(&env, PoolError::InvoiceNotListed);
         }
 
+        let issuer = ctx.issuer.clone();
         let registry_id = Self::registry_contract(&env);
         let mut args = Vec::new(&env);
-        args.push_back(invoice_id.clone().into_val(&env));
-        let issuer: Address =
-            env.invoke_contract(&invoice_contract, &Symbol::new(&env, "get_issuer"), args);
-        let mut args = Vec::new(&env);
-        args.push_back(issuer.into_val(&env));
+        args.push_back(issuer.clone().into_val(&env));
         let issuer_verified: bool =
             env.invoke_contract(&registry_id, &Symbol::new(&env, "is_verified"), args);
         if !issuer_verified {
             panic_with_error!(&env, PoolError::IssuerNotVerified);
         }
 
+        let buyer = ctx.buyer.clone();
         let mut args = Vec::new(&env);
-        args.push_back(invoice_id.clone().into_val(&env));
-        let buyer: Address =
-            env.invoke_contract(&invoice_contract, &Symbol::new(&env, "get_buyer"), args);
-        let mut args = Vec::new(&env);
-        args.push_back(buyer.into_val(&env));
+        args.push_back(buyer.clone().into_val(&env));
         let buyer_verified: bool =
             env.invoke_contract(&registry_id, &Symbol::new(&env, "is_verified"), args);
         if !buyer_verified {
             panic_with_error!(&env, PoolError::BuyerNotVerified);
         }
 
-        let mut args = Vec::new(&env);
-        args.push_back(invoice_id.clone().into_val(&env));
-        let invoice_asset: Address = env.invoke_contract(
-            &invoice_contract,
-            &Symbol::new(&env, "get_funding_asset"),
-            args,
-        );
+        let invoice_asset = ctx.funding_asset.clone();
         let usdc_id = Self::funding_asset(&env);
         if invoice_asset != usdc_id {
             panic_with_error!(&env, PoolError::AssetMismatch);
@@ -1226,6 +1293,8 @@ impl PoolContract {
         // `face_value` is read from the invoice contract via a cross-contract
         // call and is not bounded by this pool, so the scaling multiplication
         // must be guarded just like the utilization check below (#585).
+        let face_value = ctx.face_value;
+        let discount_bps = ctx.discount_bps;
         let funded_amount = face_value
             .checked_mul(10000 - discount_bps as u128)
             .unwrap_or_else(|| panic_with_error!(&env, PoolError::Overflow))
@@ -1840,6 +1909,46 @@ impl PoolContract {
                 / 10_000
     }
 
+    /// Returns the pool's active funded amount for an invoice, if any.
+    ///
+    /// A pure read of the `DataKey::FundedInvoice(invoice_id)` persistent
+    /// entry that `fund_invoice` writes and the repayment and default paths
+    /// remove, so the result mirrors the invoice's funding lifecycle exactly:
+    /// * `None` before the invoice has ever been funded through this pool.
+    /// * `Some(amount)` while the pool holds an active funding for the
+    ///   invoice, where `amount` is the USDC amount committed at funding
+    ///   (`face_value * (10000 - discount_bps) / 10000`).
+    /// * `None` again after repayment (`receive_repayment` /
+    ///   `receive_repayment_with_refund`) or default (`handle_default`)
+    ///   removes the entry.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `invoice_id` - The invoice to query the active funding for.
+    ///
+    /// # Auth
+    /// No authorization is required.
+    ///
+    /// # Panics
+    /// Never panics; this is a read-only storage lookup. No state is
+    /// written and no TTL is extended, so it can be called freely by
+    /// indexers and off-chain callers.
+    ///
+    /// # Returns
+    /// * `Option<u128>` - `Some(amount)` while the invoice is actively
+    ///   funded by this pool, `None` before funding and after
+    ///   repayment/default.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let funded = client.get_funded_amount(&invoice_id);
+    /// ```
+    pub fn get_funded_amount(env: Env, invoice_id: BytesN<32>) -> Option<u128> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FundedInvoice(invoice_id))
+    }
+
     /// Updates the pool's maximum utilization cap.
     ///
     /// The cap bounds the utilization (in basis points) that `fund_invoice`
@@ -2028,6 +2137,57 @@ impl PoolContract {
             .unwrap_or(DEFAULT_MIN_INITIAL_DEPOSIT)
     }
 
+    fn shares_for_deposit(env: &Env, usdc_amount: u128) -> u128 {
+        if usdc_amount == 0 {
+            panic_with_error!(env, PoolError::InvalidAmount);
+        }
+
+        let totals = Self::totals(env);
+        if (totals.shares == 0 || totals.deposits == 0)
+            && usdc_amount < Self::min_initial_deposit(env)
+        {
+            panic_with_error!(env, PoolError::InvalidAmount);
+        }
+
+        let shares_to_issue = if totals.shares == 0 || totals.deposits == 0 {
+            usdc_amount
+        } else {
+            let scaled = usdc_amount
+                .checked_mul(totals.shares)
+                .unwrap_or_else(|| panic_with_error!(env, PoolError::Overflow));
+            scaled / totals.deposits
+        };
+
+        if shares_to_issue == 0 {
+            panic_with_error!(env, PoolError::MinimumDeposit);
+        }
+
+        shares_to_issue
+    }
+
+    fn preview_withdraw_amount(env: &Env, shares: u128) -> u128 {
+        if shares == 0 {
+            panic_with_error!(env, PoolError::InvalidAmount);
+        }
+
+        let totals = Self::totals(env);
+        if totals.shares == 0 {
+            panic_with_error!(env, PoolError::InvalidAmount);
+        }
+
+        let available = totals.deposits - totals.funded;
+        let scaled = shares
+            .checked_mul(totals.deposits)
+            .unwrap_or_else(|| panic_with_error!(env, PoolError::Overflow));
+        let usdc_to_return = scaled / totals.shares;
+        if usdc_to_return == 0 {
+            panic_with_error!(env, PoolError::MinimumDeposit);
+        }
+        if usdc_to_return > available {
+            panic_with_error!(env, PoolError::InsufficientLiquidity);
+        }
+        usdc_to_return
+    }
     fn registry_contract(env: &Env) -> Address {
         env.storage()
             .instance()

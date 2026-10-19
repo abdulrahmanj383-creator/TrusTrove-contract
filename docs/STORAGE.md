@@ -185,15 +185,15 @@ Cancelled = 8   // issuer cancelled before listing
 
 #### Index Entries
 
-| DataKey | Type | Description |
-|---------|------|-------------|
-| `IssuerIndexCount(Address)` | `u32` | Number of invoices for this issuer |
-| `IssuerIndexEntry(Address, u32)` | `BytesN<32>` | Invoice ID by issuer + index |
-| `BuyerIndexCount(Address)` | `u32` | Number of invoices for this buyer |
-| `BuyerIndexEntry(Address, u32)` | `BytesN<32>` | Invoice ID by buyer + index |
-| `StatusIndexCount(u32)` | `u32` | Number of invoices in this status |
-| `StatusIndexEntry(u32, u32)` | `BytesN<32>` | Invoice ID by status + index |
-| `StatusCount(u32)` | `u64` | Count of invoices in each status |
+| DataKey | Type | Description | TTL extended |
+|---------|------|-------------|--------------|
+| `IssuerIndexCount(Address)` | `u32` | Number of invoices for this issuer | On write (`extend_issuer_index`) and on read (`get_by_issuer`) |
+| `IssuerIndexEntry(Address, u32)` | `BytesN<32>` | Invoice ID by issuer + index | On write (`extend_issuer_index`) and on read (`get_by_issuer`) |
+| `BuyerIndexCount(Address)` | `u32` | Number of invoices for this buyer | On write (`extend_buyer_index`) and on read (`get_by_buyer`) |
+| `BuyerIndexEntry(Address, u32)` | `BytesN<32>` | Invoice ID by buyer + index | On write (`extend_buyer_index`) and on read (`get_by_buyer`) |
+| `StatusIndexCount(u32)` | `u32` | Number of invoices in this status | On write (`extend_status_index` / `remove_from_status_index`) and on read (`get_by_status`) |
+| `StatusIndexEntry(u32, u32)` | `BytesN<32>` | Invoice ID by status + index | On write (`extend_status_index` / `remove_from_status_index`) and on read (`get_by_status`) |
+| `StatusCount(u32)` | `u64` | Count of invoices in each status | On write (`increment_status_count` / `decrement_status_count`, issue #830) |
 
 #### Indexing Notes
 
@@ -230,6 +230,7 @@ Cancelled = 8   // issuer cancelled before listing
 | `InvoiceContract` | `Address` | Invoice contract address | `initialize()` |
 | `UsdcAsset` | `Address` | USDC token contract address | `initialize()` |
 | `Paused` | `bool` | Emergency circuit-breaker flag, via `trusttrove_pause::PauseState::Paused` (issue #716). Absent means not paused. | `pause()` / `unpause()` |
+| `TimeoutWindow` | `u64` | Seconds after `locked_at` before `release_after_timeout` may permissionlessly return a lock to the pool. Absent means the 30-day default; capped at 365 days. | `set_timeout_window()` |
 
 ### Persistent Storage
 
@@ -405,10 +406,12 @@ See [LIMITATIONS.md](./LIMITATIONS.md) for current testnet budget constraints.
 
 ## Upgrade Path
 
-The invoice and escrow contracts expose an admin-gated `upgrade(new_wasm_hash)`
-entry point. First install the new Wasm on the network, then call `upgrade`
-with its hash from the contract's stored admin address. The contract is updated
-in place, so its address and storage remain unchanged. Other contracts still
-require a redeploy if they do not expose this entry point. Protect the admin
+The invoice, escrow, pool, and registry contracts expose an admin-gated
+`upgrade(new_wasm_hash: BytesN<32>)` entry point backed by Soroban's
+`env.deployer().update_current_contract_wasm`. First install the new Wasm on the
+network, then call `upgrade` with its hash from the contract's stored admin
+address. The contract is updated in place, so its address and storage remain
+unchanged, and an `upgraded` event carrying the new Wasm hash is emitted. Calls
+from any address other than the stored admin fail authorization. Protect the admin
 with a multisig as described in [DEPLOYMENT.md](../DEPLOYMENT.md). See that
 document for the redeployment rollback procedure.

@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, map, panic_with_error, Address, Env, Map, String, Vec};
+use soroban_sdk::{
+    contract, contractimpl, map, panic_with_error, Address, BytesN, Env, Map, String, Vec,
+};
 use trusttrove_pause::{require_not_paused, set_paused};
 
 mod constants;
@@ -63,6 +65,27 @@ impl RegistryContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         events::contract_initialized(&env, &admin);
         Self::extend_instance_ttl(&env);
+    }
+
+    /// Replaces this contract's Wasm with an installed Wasm using the stored admin.
+    ///
+    /// The contract address and storage are preserved. Emits an `upgraded`
+    /// event carrying the new Wasm hash.
+    ///
+    /// # Panics
+    /// * `RegistryError::NotInitialized` if no admin is stored.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::NotInitialized));
+        admin.require_auth();
+
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        Self::extend_instance_ttl(&env);
+        events::upgraded(&env, &new_wasm_hash);
     }
 
     /// Registers a new issuer profile with initial metadata.
@@ -403,6 +426,14 @@ impl RegistryContract {
     /// the same threshold and target duration as the write path, and returns
     /// the stored value.
     ///
+    /// Note: the returned `Profile` encodes `role`/`verified`/`revoked` in a
+    /// single internal `packed_flags` bitmask. That bit layout is a private
+    /// implementation detail, not a stable external contract (#609). Clients
+    /// that only have RPC access should read the decoded views
+    /// [`get_role`](Self::get_role), [`is_verified`](Self::is_verified) and
+    /// [`get_verification_status`](Self::get_verification_status) instead of
+    /// reverse-engineering `packed_flags`.
+    ///
     /// # Arguments
     /// * `env` - The Soroban environment.
     /// * `address` - The address of the profile to retrieve.
@@ -482,6 +513,53 @@ impl RegistryContract {
             Some(p) if p.verified() => VerificationStatus::Verified,
             Some(p) if p.revoked() => VerificationStatus::Revoked,
             Some(_) => VerificationStatus::Pending,
+        }
+    }
+
+    /// Returns the decoded [`Role`] of a registered address, if any.
+    ///
+    /// Lightweight decoded accessor that sits alongside
+    /// [`is_verified`](Self::is_verified) and
+    /// [`get_verification_status`](Self::get_verification_status) (#609).
+    /// [`get_profile`](Self::get_profile) returns the raw `Profile` struct,
+    /// whose `role`/`verified`/`revoked` state is stored as an internal
+    /// `packed_flags` bitmask; this view decodes the role on-chain so
+    /// off-chain consumers (indexers, explorers, RPC clients) never have to
+    /// reverse-engineer that private layout to learn whether an address is
+    /// an `Issuer` or a `Buyer`.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `address` - The address to look up.
+    ///
+    /// # Auth
+    /// * No `require_auth()` call is made — this is a read-only view.
+    ///
+    /// # Panics
+    /// * Does not panic — unregistered addresses are reported as `None`,
+    ///   mirroring how `get_verification_status` reports `Unregistered`.
+    ///
+    /// # Returns
+    /// * `Option<Role>` - `Some(role)` when a profile is stored for
+    ///   `address`, `None` otherwise. When the entry exists, its TTL is
+    ///   extended using the same threshold and target duration as the write
+    ///   path.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let role = client.get_role(&issuer); // Some(Role::Issuer)
+    /// ```
+    pub fn get_role(env: Env, address: Address) -> Option<Role> {
+        let key = DataKey::Profile(address);
+        match env.storage().persistent().get::<_, Profile>(&key) {
+            Some(profile) => {
+                let role = profile.role();
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+                Some(role)
+            }
+            None => None,
         }
     }
 
@@ -664,6 +742,16 @@ impl RegistryContract {
     /// `address_reinstated` event so integrators can distinguish
     /// reinstatement from a generic verification toggle.
     ///
+    /// Like `revoke`, it is guarded by an idempotency check (#606): it only
+    /// operates on profiles whose `revoked` flag is set. Calling it on a
+    /// profile that was never revoked — a `Pending` profile or one that is
+    /// already `Verified` — is a no-op that returns `true` without writing
+    /// storage or emitting `address_reinstated`. This keeps `reinstate` from
+    /// being used as an undocumented alternate path to verify a `Pending`
+    /// profile (use `verify_profile` for that), and keeps the
+    /// `address_reinstated` event honest for off-chain indexers: it is only
+    /// ever emitted for an actual un-revocation.
+    ///
     /// # Arguments
     /// * `env` - The Soroban environment.
     /// * `address` - The registered address whose verification should be
@@ -679,7 +767,9 @@ impl RegistryContract {
     /// * `RegistryError::NotFound` if no profile is stored for `address`.
     ///
     /// # Returns
-    /// * `bool` - `true` when the profile is successfully reinstated.
+    /// * `bool` - `true` when the profile is verified or the call required no
+    ///   action: a successful reinstatement, an already-verified profile, or
+    ///   a never-revoked (`Pending`) profile left untouched.
     ///
     /// # Example
     /// ```ignore
@@ -695,6 +785,9 @@ impl RegistryContract {
             .persistent()
             .get(&key)
             .unwrap_or_else(|| panic_with_error!(&env, RegistryError::NotFound));
+        if !profile.revoked() {
+            return true;
+        }
         profile.set_verified(true);
         profile.set_revoked(false);
         env.storage().persistent().set(&key, &profile);
@@ -706,10 +799,40 @@ impl RegistryContract {
         true
     }
 
-    pub fn verify_profile(env: Env, address: Address, verify: bool) -> bool {
+    /// Sets (or clears) the verification flag on a registered profile.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `caller` - The address authorizing the call. Must be either the
+    ///   stored admin (`DataKey::Admin`) or the stored verifier
+    ///   (`DataKey::Verifier`, see [`set_verifier`](Self::set_verifier)).
+    /// * `address` - The registered address whose verification changes.
+    /// * `verify` - `true` to verify (also clears the revoked flag), `false`
+    ///   to un-verify (also marks the profile revoked).
+    ///
+    /// # Auth
+    /// * Requires `caller.require_auth()`, where `caller` is the admin or the
+    ///   verifier (#732). This lets day-to-day KYC decisions be delegated to an
+    ///   operational key without handing out admin control.
+    ///
+    /// # Panics
+    /// * `RegistryError::NotInitialized` if the contract has not been
+    ///   initialized.
+    /// * `RegistryError::Unauthorized` if `caller` is neither the admin nor
+    ///   the verifier.
+    /// * `RegistryError::NotFound` if no profile is stored for `address`.
+    ///
+    /// # Returns
+    /// * `bool` - `true` when the profile is updated.
+    ///
+    /// # Example
+    /// ```ignore
+    /// client.verify_profile(&verifier, &issuer, &true);
+    /// ```
+    pub fn verify_profile(env: Env, caller: Address, address: Address, verify: bool) -> bool {
         require_not_paused(&env);
-        let admin = Self::require_admin(&env);
-        admin.require_auth();
+        Self::require_admin_or_verifier(&env, &caller);
+        caller.require_auth();
         let key = DataKey::Profile(address.clone());
         let mut profile: Profile = env
             .storage()
@@ -793,12 +916,74 @@ impl RegistryContract {
         Self::extend_instance_ttl(&env);
     }
 
+    /// Assigns the verifier role to `verifier`, replacing any previous one.
+    ///
+    /// The verifier may call [`verify_profile`](Self::verify_profile) in
+    /// addition to the admin. It is deliberately a narrow, operational role
+    /// (#732): it cannot call `transfer_admin`, `transfer_ownership`, `pause`,
+    /// `unpause`, `revoke`, `reinstate`, `batch_register_*`, `set_verifier`
+    /// or `remove_verifier` — all of those stay admin-only.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `verifier` - The address to grant the verifier role.
+    ///
+    /// # Auth
+    /// * Requires `admin.require_auth()` — only the stored admin may assign
+    ///   the verifier.
+    ///
+    /// # Panics
+    /// * `RegistryError::NotInitialized` if the contract has not been
+    ///   initialized.
+    ///
+    /// # Example
+    /// ```ignore
+    /// client.set_verifier(&verifier);
+    /// ```
+    pub fn set_verifier(env: Env, verifier: Address) {
+        require_not_paused(&env);
+        let admin = Self::require_admin(&env);
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Verifier, &verifier);
+        events::verifier_set(&env, &admin, &verifier);
+        Self::extend_instance_ttl(&env);
+    }
+
+    /// Clears the verifier role so only the admin can call `verify_profile`.
+    ///
+    /// Idempotent: calling it when no verifier is set is a no-op apart from
+    /// the emitted `verifier_removed` event.
+    ///
+    /// # Auth
+    /// * Requires `admin.require_auth()`.
+    ///
+    /// # Panics
+    /// * `RegistryError::NotInitialized` if the contract has not been
+    ///   initialized.
+    pub fn remove_verifier(env: Env) {
+        require_not_paused(&env);
+        let admin = Self::require_admin(&env);
+        admin.require_auth();
+        env.storage().instance().remove(&DataKey::Verifier);
+        events::verifier_removed(&env, &admin);
+        Self::extend_instance_ttl(&env);
+    }
+
+    /// Returns the current verifier, or `None` if the role is unassigned.
+    ///
+    /// # Auth
+    /// * No `require_auth()` call is made — this is a read-only view.
+    pub fn get_verifier(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Verifier)
+    }
+
     /// Engages the emergency circuit breaker.
     ///
     /// While paused every state-changing entry point (registration, profile
     /// updates, revocation/reinstatement, verification, batch operations and
     /// admin transfers) reverts with `ContractPaused`, while read-only views
-    /// (`get_profile`, `is_verified`, `get_verification_status`, `get_admin`)
+    /// (`get_profile`, `is_verified`, `get_verification_status`, `get_role`,
+    /// `get_admin`)
     /// stay callable. Only the stored admin may pause, and [`Self::unpause`] is
     /// intentionally never guarded so a paused registry can always be
     /// resumed. Emits `paused`.
@@ -894,6 +1079,19 @@ impl RegistryContract {
             .instance()
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(env, RegistryError::NotInitialized))
+    }
+
+    /// Panics with `Unauthorized` unless `caller` is the stored admin or the
+    /// stored verifier. Does not call `require_auth` — the caller does that.
+    fn require_admin_or_verifier(env: &Env, caller: &Address) {
+        let admin = Self::require_admin(env);
+        if *caller == admin {
+            return;
+        }
+        let verifier: Option<Address> = env.storage().instance().get(&DataKey::Verifier);
+        if verifier.as_ref() != Some(caller) {
+            panic_with_error!(env, RegistryError::Unauthorized);
+        }
     }
 
     fn require_initialized(env: &Env) {

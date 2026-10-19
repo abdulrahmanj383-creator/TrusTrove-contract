@@ -76,8 +76,8 @@ fn setup_fee_lifecycle() -> FeeLifecycle {
     let metadata: Map<String, String> = Map::new(&env);
     registry.register_issuer(&issuer, &metadata);
     registry.register_buyer(&buyer, &metadata);
-    registry.verify_profile(&issuer, &true);
-    registry.verify_profile(&buyer, &true);
+    registry.verify_profile(&admin, &issuer, &true);
+    registry.verify_profile(&admin, &buyer, &true);
 
     let invoice_id = env.register_contract(None, InvoiceContract);
     let escrow_id = env.register_contract(None, EscrowContract);
@@ -299,8 +299,8 @@ fn test_cross_contract_invoice_pool_escrow_lifecycle() {
     let metadata: Map<String, String> = Map::new(&env);
     registry.register_issuer(&issuer, &metadata);
     registry.register_buyer(&buyer, &metadata);
-    registry.verify_profile(&issuer, &true);
-    registry.verify_profile(&buyer, &true);
+    registry.verify_profile(&admin, &issuer, &true);
+    registry.verify_profile(&admin, &buyer, &true);
     assert!(registry.is_verified(&issuer));
     assert!(registry.is_verified(&buyer));
 
@@ -523,8 +523,8 @@ fn test_cross_contract_partial_repayment_lifecycle() {
     let metadata: Map<String, String> = Map::new(&env);
     registry.register_issuer(&issuer, &metadata);
     registry.register_buyer(&buyer, &metadata);
-    registry.verify_profile(&issuer, &true);
-    registry.verify_profile(&buyer, &true);
+    registry.verify_profile(&admin, &issuer, &true);
+    registry.verify_profile(&admin, &buyer, &true);
 
     // 3. Deploy real Invoice, Escrow, and Pool contracts
     let invoice_id = env.register_contract(None, InvoiceContract);
@@ -676,8 +676,8 @@ fn test_partial_repayment_then_default_lifecycle() {
     let metadata: Map<String, String> = Map::new(&env);
     registry.register_issuer(&issuer, &metadata);
     registry.register_buyer(&buyer, &metadata);
-    registry.verify_profile(&issuer, &true);
-    registry.verify_profile(&buyer, &true);
+    registry.verify_profile(&admin, &issuer, &true);
+    registry.verify_profile(&admin, &buyer, &true);
 
     // 3. Deploy real Invoice, Escrow, and Pool contracts
     let invoice_id = env.register_contract(None, InvoiceContract);
@@ -872,8 +872,8 @@ fn test_partial_repayment_then_default_pool_loss_calculation() {
     let metadata: Map<String, String> = Map::new(&env);
     registry.register_issuer(&issuer, &metadata);
     registry.register_buyer(&buyer, &metadata);
-    registry.verify_profile(&issuer, &true);
-    registry.verify_profile(&buyer, &true);
+    registry.verify_profile(&admin, &issuer, &true);
+    registry.verify_profile(&admin, &buyer, &true);
 
     // 3. Deploy real Invoice, Escrow, and Pool contracts
     let invoice_id = env.register_contract(None, InvoiceContract);

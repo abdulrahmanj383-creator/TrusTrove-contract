@@ -28,6 +28,9 @@ use trusttrove_escrow::{EscrowContract as RealEscrow, EscrowContractClient as Re
 use trusttrove_invoice::{
     InvoiceContract as RealInvoice, InvoiceContractClient as RealInvoiceClient,
 };
+use trusttrove_test_utils::{
+    setup_full_protocol, test_agent_id, test_agent_pubkey, test_agent_signing_key,
+};
 
 // Default invoice parameters matching create_and_list() defaults
 // These computed constants eliminate magic numbers in test assertions
@@ -103,24 +106,7 @@ impl MockAgentRegistry {
 #[contracttype]
 pub struct AgentKey(Symbol);
 
-const TEST_AGENT_SEED: [u8; 32] = [7u8; 32];
-
-fn test_agent_signing_key() -> k256::ecdsa::SigningKey {
-    k256::ecdsa::SigningKey::from_slice(&TEST_AGENT_SEED).unwrap()
-}
-
-fn test_agent_pubkey(env: &Env) -> BytesN<65> {
-    let point = test_agent_signing_key()
-        .verifying_key()
-        .to_encoded_point(false);
-    let mut bytes = [0u8; 65];
-    bytes.copy_from_slice(point.as_bytes());
-    BytesN::from_array(env, &bytes)
-}
-
-fn test_agent_id(env: &Env) -> Symbol {
-    Symbol::new(env, "test_agent")
-}
+// Shared test_agent helpers imported from trusttrove_test_utils (Issue #813)
 
 /// Submits a validly signed attestation for `invoice_id` against the
 /// agent-registry wired up in `setup()`, unlocking it for
@@ -254,6 +240,37 @@ impl MockHugeFaceInvoice {
             .instance()
             .get(&InvKey(Symbol::new(&env, "asset")))
             .unwrap()
+    }
+
+    pub fn get_funding_context(env: Env, _invoice_id: BytesN<32>) -> crate::FundingContext {
+        crate::FundingContext {
+            status: 1, // Listed
+            face_value: env
+                .storage()
+                .instance()
+                .get(&InvKey(Symbol::new(&env, "face")))
+                .unwrap(),
+            discount_bps: env
+                .storage()
+                .instance()
+                .get(&InvKey(Symbol::new(&env, "disc")))
+                .unwrap(),
+            issuer: env
+                .storage()
+                .instance()
+                .get(&InvKey(Symbol::new(&env, "issuer")))
+                .unwrap(),
+            buyer: env
+                .storage()
+                .instance()
+                .get(&InvKey(Symbol::new(&env, "buyer")))
+                .unwrap(),
+            funding_asset: env
+                .storage()
+                .instance()
+                .get(&InvKey(Symbol::new(&env, "asset")))
+                .unwrap(),
+        }
     }
 
     pub fn get_face_value(env: Env, _invoice_id: BytesN<32>) -> u128 {
@@ -486,6 +503,75 @@ fn test_second_deposit_scales_by_share_price() {
     let pos = te.pool.get_lp_position(&te.lp);
     assert_eq!(pos.shares, 14_901_960_784);
     assert_eq!(pos.deposit_count, 2);
+}
+
+#[test]
+fn test_preview_deposit_matches_deposit_across_share_prices() {
+    let amounts = [
+        DEFAULT_MIN_INITIAL_DEPOSIT,
+        DEFAULT_MIN_INITIAL_DEPOSIT * 2,
+        5_000_000_000,
+    ];
+
+    // An empty pool mints one share per unit deposited.
+    for amount in amounts {
+        let te = setup();
+        let preview = te.pool.preview_deposit(&amount);
+        let issued = te.pool.deposit(&te.lp, &amount);
+        assert_eq!(preview, issued);
+        assert_eq!(preview, amount);
+    }
+
+    // A pool with a 1:1 share price preserves the same ratio for later deposits.
+    for amount in amounts {
+        let te = setup();
+        te.pool.deposit(&te.lp, &10_000_000_000);
+        let before = te.pool.get_stats();
+        let preview = te.pool.preview_deposit(&amount);
+        let after = te.pool.get_stats();
+        assert_eq!(after.total_deposits, before.total_deposits);
+        assert_eq!(after.total_shares, before.total_shares);
+        let issued = te.pool.deposit(&te.lp, &amount);
+        assert_eq!(preview, issued);
+    }
+
+    // Repayment yield raises the share price, so previews must use the same
+    // floor rounding as a real deposit at that price.
+    for amount in [2u128, 3, 1_000_000, 5_000_000_000] {
+        let te = setup();
+        te.pool.deposit(&te.lp, &10_000_000_000);
+        fund_and_repay_invoice(&te);
+        let preview = te.pool.preview_deposit(&amount);
+        let issued = te.pool.deposit(&te.lp, &amount);
+        assert_eq!(preview, issued);
+    }
+}
+
+#[test]
+fn test_preview_deposit_requires_no_authorization() {
+    let te = setup();
+    te.env.set_auths(&[]);
+
+    assert_eq!(
+        te.pool.preview_deposit(&DEFAULT_MIN_INITIAL_DEPOSIT),
+        DEFAULT_MIN_INITIAL_DEPOSIT
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_preview_deposit_rejects_zero_amount() {
+    let te = setup();
+    te.pool.preview_deposit(&0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_preview_deposit_rejects_dust_after_yield() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    fund_and_repay_invoice(&te);
+    te.pool.preview_deposit(&1);
 }
 
 //  DUST ATTACK / 0-SHARE TESTS (issue #129)
@@ -758,6 +844,48 @@ fn test_withdraw_more_than_owned_panics() {
     te.pool.withdraw(&te.lp, &20_000_000_000);
 }
 
+#[test]
+fn test_preview_withdraw_matches_withdraw_without_yield() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &10_000_000_000);
+
+    // The generated Soroban client takes scalar arguments by reference, even though the contract entry point uses u128 by value.
+    // Preview is a public read and succeeds with auth disabled.
+    te.env.set_auths(&[]);
+    let preview = te.pool.preview_withdraw(&5_000_000_000);
+    te.env.mock_all_auths_allowing_non_root_auth();
+    let actual = te.pool.withdraw(&te.lp, &5_000_000_000);
+    assert_eq!(preview, actual);
+}
+
+#[test]
+fn test_preview_withdraw_matches_withdraw_after_yield() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    fund_and_repay_invoice(&te);
+
+    let preview = te.pool.preview_withdraw(&5_000_000_000);
+    let actual = te.pool.withdraw(&te.lp, &5_000_000_000);
+    assert_eq!(preview, actual);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_preview_withdraw_rejects_zero_shares() {
+    let te = setup();
+    te.pool.preview_withdraw(&0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_preview_withdraw_fails_if_insufficient_liquidity() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+    let _ = te.pool.fund_invoice(&invoice_id);
+
+    te.pool.preview_withdraw(&300_000_000);
+}
 //  TRANSFER TESTS
 #[test]
 fn test_transfer_succeeds() {
@@ -3634,8 +3762,8 @@ mod real_registry_integration {
         // explicitly verified by the admin before is_verified() returns true.
         assert!(!registry.is_verified(&issuer));
         assert!(!registry.is_verified(&buyer));
-        registry.verify_profile(&issuer, &true);
-        registry.verify_profile(&buyer, &true);
+        registry.verify_profile(&admin, &issuer, &true);
+        registry.verify_profile(&admin, &buyer, &true);
         assert!(registry.is_verified(&issuer));
         assert!(registry.is_verified(&buyer));
         assert_eq!(
@@ -5375,6 +5503,14 @@ fn test_set_protocol_fee_event_reports_treasury_change_with_unchanged_fee() {
     assert_eq!(te.pool.get_protocol_fee_bps(), 500);
 }
 
+#[test]
+fn test_shared_fixture_setup_full_protocol() {
+    let proto = setup_full_protocol();
+    assert_eq!(proto.pool.get_admin(), proto.admin);
+    assert_eq!(proto.pool.get_stats().total_funded, 0);
+    assert_eq!(proto.invoice.get_admin(), Some(proto.admin));
+}
+
 //  ISSUE #842: MULTI-LP SHARE-SUPPLY CONSERVATION //
 // The share ledger lives in two places: `total_supply()` (instance
 // `TotalShares`) and each LP's `balance()` (persistent `LPShares`). Deposit
@@ -6670,4 +6806,347 @@ fn test_batch_fund_invoice_allows_exactly_max_batch_size() {
     let funded = te.pool.batch_fund_invoice(&ids);
     assert_eq!(funded.len(), MAX_BATCH_SIZE);
     assert_eq!(te.pool.get_stats().active_invoice_count, MAX_BATCH_SIZE);
+}
+
+// ============== GET_FUNDED_AMOUNT VIEW TESTS (issue #839) ==============
+
+// The four states of `DataKey::FundedInvoice`, each reached through the
+// contract's real fund / repayment / default entry points rather than by
+// writing storage directly, so the assertions exercise the same lifecycle an
+// on-chain indexer would observe.
+
+// Unfunded: a listed invoice the pool has never funded has no
+// `FundedInvoice` entry, so the view reports `None`.
+#[test]
+fn test_get_funded_amount_returns_none_for_unfunded_invoice() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &100_000_000_000);
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+
+    assert_eq!(te.pool.get_funded_amount(&invoice_id), None);
+
+    // An invoice id the pool has never seen at all also reports `None`
+    // (the storage lookup never panics for unknown ids).
+    let unknown_id = BytesN::from_array(&te.env, &[0xAB; 32]);
+    assert_eq!(te.pool.get_funded_amount(&unknown_id), None);
+}
+
+// Funded: after `fund_invoice` commits capital, the view reports exactly
+// the amount that was funded.
+#[test]
+fn test_get_funded_amount_returns_amount_while_funded() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &100_000_000_000);
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+    te.pool.fund_invoice(&invoice_id);
+
+    // face_value=10_000_000_000, discount_bps=200
+    // funded_amount = 10_000_000_000 * (10000 - 200) / 10000 = 9_800_000_000
+    assert_eq!(
+        te.pool.get_funded_amount(&invoice_id),
+        Some(DEFAULT_FUNDED_AMOUNT)
+    );
+}
+
+// Repaid: the full production repayment path (ship -> confirm ->
+// `invoice.repay`, which calls back into `receive_repayment` and
+// `settle_repayment`) removes the `FundedInvoice` entry, so the view
+// returns to `None`.
+#[test]
+fn test_get_funded_amount_returns_none_after_repayment() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &100_000_000_000);
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+    te.pool.fund_invoice(&invoice_id);
+    assert_eq!(
+        te.pool.get_funded_amount(&invoice_id),
+        Some(DEFAULT_FUNDED_AMOUNT)
+    );
+
+    te.invoice.mark_shipped(&invoice_id);
+    te.invoice.confirm_delivery(&invoice_id, &te.issuer);
+    te.invoice.confirm_delivery(&invoice_id, &te.buyer);
+    te.env
+        .ledger()
+        .set_timestamp(te.env.ledger().timestamp() + 86401);
+    te.invoice.repay(&invoice_id);
+
+    assert_eq!(te.pool.get_funded_amount(&invoice_id), None);
+}
+
+// Defaulted: the default path removes the `FundedInvoice` entry too, so
+// the view returns `None` after `handle_default` completes. This drives
+// `pool.handle_default` (the entry point `invoice.trigger_default`
+// invokes) like the rest of the default-path suite; the direct
+// `invoice.trigger_default` chain is currently pinned to panic on
+// self-re-entrancy by `test_trigger_default_drives_full_pool_and_escrow_chain`.
+#[test]
+fn test_get_funded_amount_returns_none_after_default() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &100_000_000_000);
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+    te.pool.fund_invoice(&invoice_id);
+    assert_eq!(
+        te.pool.get_funded_amount(&invoice_id),
+        Some(DEFAULT_FUNDED_AMOUNT)
+    );
+
+    // Advance past escrow's lock-age grace period so `escrow.handle_default`
+    // releases the locked funds back to the pool.
+    te.env
+        .ledger()
+        .set_timestamp(te.env.ledger().timestamp() + 60);
+    assert!(te.pool.handle_default(&invoice_id));
+
+    assert_eq!(te.pool.get_funded_amount(&invoice_id), None);
+}
+
+#[test]
+#[should_panic(expected = "Error(Auth")]
+fn test_upgrade_requires_admin_auth() {
+    let te = setup();
+    te.env.set_auths(&[]);
+    te.pool.upgrade(&BytesN::from_array(&te.env, &[0; 32]));
+}
+
+// --------------- Counting mock invoice (issue #833) ---------------
+//
+// Stand-in for the pool's invoice contract that tallies every cross-contract
+// call `fund_invoice` makes into it. Used to prove the funding path now reads
+// the invoice exactly once (`get_funding_context`) plus the terminal
+// `mark_funded`, instead of four separate reads plus `mark_funded`.
+//
+// Wrapped in its own module because `#[contractimpl]` generates per-method
+// dispatch symbols from the *method* name only: identical entrypoint names
+// (`configure`, `get_issuer`, …) in two mocks in one module would collide.
+mod counting_invoice {
+    use crate::FundingContext;
+    use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, Symbol};
+
+    #[contract]
+    pub struct MockCountingInvoice;
+
+    #[contractimpl]
+    impl MockCountingInvoice {
+        fn bump(env: &Env, name: &str) {
+            let key = super::InvKey(Symbol::new(env, name));
+            let count: u32 = env.storage().instance().get(&key).unwrap_or(0);
+            env.storage().instance().set(&key, &(count + 1));
+        }
+
+        pub fn configure_counting(
+            env: Env,
+            issuer: Address,
+            buyer: Address,
+            funding_asset: Address,
+            face_value: u128,
+            discount_bps: u32,
+        ) {
+            env.storage()
+                .instance()
+                .set(&super::InvKey(Symbol::new(&env, "issuer")), &issuer);
+            env.storage()
+                .instance()
+                .set(&super::InvKey(Symbol::new(&env, "buyer")), &buyer);
+            env.storage()
+                .instance()
+                .set(&super::InvKey(Symbol::new(&env, "asset")), &funding_asset);
+            env.storage()
+                .instance()
+                .set(&super::InvKey(Symbol::new(&env, "face")), &face_value);
+            env.storage()
+                .instance()
+                .set(&super::InvKey(Symbol::new(&env, "disc")), &discount_bps);
+        }
+
+        pub fn call_count(env: Env, name: Symbol) -> u32 {
+            env.storage()
+                .instance()
+                .get(&super::InvKey(name))
+                .unwrap_or(0)
+        }
+
+        // Entrypoint names below must match what the pool's production code
+        // invokes: `get_funding_context` and `mark_funded` exactly; the four
+        // legacy names exist only so their counters stay at zero.
+        pub fn get_funding_context(env: Env, _invoice_id: BytesN<32>) -> FundingContext {
+            Self::bump(&env, "ctx_n");
+            FundingContext {
+                status: 1, // Listed
+                face_value: env
+                    .storage()
+                    .instance()
+                    .get(&super::InvKey(Symbol::new(&env, "face")))
+                    .unwrap(),
+                discount_bps: env
+                    .storage()
+                    .instance()
+                    .get(&super::InvKey(Symbol::new(&env, "disc")))
+                    .unwrap(),
+                issuer: env
+                    .storage()
+                    .instance()
+                    .get(&super::InvKey(Symbol::new(&env, "issuer")))
+                    .unwrap(),
+                buyer: env
+                    .storage()
+                    .instance()
+                    .get(&super::InvKey(Symbol::new(&env, "buyer")))
+                    .unwrap(),
+                funding_asset: env
+                    .storage()
+                    .instance()
+                    .get(&super::InvKey(Symbol::new(&env, "asset")))
+                    .unwrap(),
+            }
+        }
+
+        pub fn get_funding_terms(env: Env, _invoice_id: BytesN<32>) -> (u32, u128, u32) {
+            Self::bump(&env, "terms_n");
+            (
+                1,
+                env.storage()
+                    .instance()
+                    .get(&super::InvKey(Symbol::new(&env, "face")))
+                    .unwrap(),
+                env.storage()
+                    .instance()
+                    .get(&super::InvKey(Symbol::new(&env, "disc")))
+                    .unwrap(),
+            )
+        }
+
+        pub fn get_issuer(env: Env, _invoice_id: BytesN<32>) -> Address {
+            Self::bump(&env, "issuer_n");
+            env.storage()
+                .instance()
+                .get(&super::InvKey(Symbol::new(&env, "issuer")))
+                .unwrap()
+        }
+
+        pub fn get_buyer(env: Env, _invoice_id: BytesN<32>) -> Address {
+            Self::bump(&env, "buyer_n");
+            env.storage()
+                .instance()
+                .get(&super::InvKey(Symbol::new(&env, "buyer")))
+                .unwrap()
+        }
+
+        pub fn get_funding_asset(env: Env, _invoice_id: BytesN<32>) -> Address {
+            Self::bump(&env, "asset_n");
+            env.storage()
+                .instance()
+                .get(&super::InvKey(Symbol::new(&env, "asset")))
+                .unwrap()
+        }
+
+        pub fn mark_funded(
+            env: Env,
+            _invoice_id: BytesN<32>,
+            _pool: Address,
+            _asset: Address,
+            _amount: u128,
+        ) -> bool {
+            Self::bump(&env, "mark_n");
+            true
+        }
+    }
+}
+
+/// #833: `fund_invoice` must touch the invoice contract exactly twice —
+/// one batched `get_funding_context` read plus the terminal `mark_funded`.
+/// Before the fix it was five calls (`get_funding_terms`, `get_issuer`,
+/// `get_buyer`, `get_funding_asset`, `mark_funded`). The old read entrypoints
+/// are still implemented on the mock and their counters prove the funding
+/// path no longer invokes them.
+#[test]
+fn test_fund_invoice_reads_invoice_once_via_get_funding_context() {
+    let te = setup();
+    let mock_id = te
+        .env
+        .register_contract(None, counting_invoice::MockCountingInvoice);
+    counting_invoice::MockCountingInvoiceClient::new(&te.env, &mock_id).configure_counting(
+        &te.issuer,
+        &te.buyer,
+        &te.usdc_id,
+        &DEFAULT_FACE_VALUE,
+        &DEFAULT_DISCOUNT_BPS,
+    );
+    te.env.as_contract(&te.pool_id, || {
+        te.env
+            .storage()
+            .instance()
+            .set(&DataKey::InvoiceContract, &mock_id);
+    });
+    te.pool.deposit(&te.lp, &100_000_000_000);
+
+    let invoice_id = BytesN::from_array(&te.env, &[42u8; 32]);
+    assert!(te.pool.fund_invoice(&invoice_id));
+
+    let count = |name: &str| -> u32 {
+        te.env.as_contract(&mock_id, || {
+            te.env
+                .storage()
+                .instance()
+                .get::<_, u32>(&InvKey(Symbol::new(&te.env, name)))
+                .unwrap_or(0)
+        })
+    };
+    assert_eq!(count("ctx_n"), 1, "exactly one batched invoice read");
+    assert_eq!(count("mark_n"), 1);
+    assert_eq!(count("terms_n"), 0, "get_funding_terms must not be called");
+    assert_eq!(count("issuer_n"), 0, "get_issuer must not be called");
+    assert_eq!(count("buyer_n"), 0, "get_buyer must not be called");
+    assert_eq!(count("asset_n"), 0, "get_funding_asset must not be called");
+    assert_eq!(
+        count("ctx_n")
+            + count("terms_n")
+            + count("issuer_n")
+            + count("buyer_n")
+            + count("asset_n")
+            + count("mark_n"),
+        2,
+        "total invoice-contract calls per funding should be 2 (was 5 before #833)"
+    );
+
+    // State transitions on the pool side are unchanged by the consolidation.
+    let stats = te.pool.get_stats();
+    assert_eq!(stats.total_funded, DEFAULT_FUNDED_AMOUNT);
+    assert_eq!(stats.active_invoice_count, 1);
+    let funded: u128 = te.env.as_contract(&te.pool_id, || {
+        te.env
+            .storage()
+            .persistent()
+            .get(&DataKey::FundedInvoice(invoice_id.clone()))
+            .unwrap()
+    });
+    assert_eq!(funded, DEFAULT_FUNDED_AMOUNT);
+}
+
+/// #833 budget regression guard. Baseline on plain `upstream/main` @
+/// `7d2c9198` (four separate invoice reads) for this exact
+/// deposit + create_and_list + fund_invoice sequence measured
+/// cpu = 1,503,282 and memory = 281,310 host budget units. With the single
+/// batched read the call must land strictly below that baseline; host budget
+/// accounting is deterministic, so these ceilings are stable.
+#[test]
+fn test_fund_invoice_host_budget_below_four_call_baseline() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &100_000_000_000);
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+
+    te.env.budget().reset_default();
+    assert!(te.pool.fund_invoice(&invoice_id));
+    let cpu = te.env.budget().cpu_instruction_cost();
+    let mem = te.env.budget().memory_bytes_cost();
+    std::println!("FUND833_BUDGET cpu={cpu} mem={mem}");
+
+    assert!(
+        cpu < 1_503_282,
+        "batched read should reduce fund_invoice CPU vs the four-call baseline: {cpu}"
+    );
+    assert!(
+        mem < 281_310,
+        "batched read should reduce fund_invoice memory vs the four-call baseline: {mem}"
+    );
 }

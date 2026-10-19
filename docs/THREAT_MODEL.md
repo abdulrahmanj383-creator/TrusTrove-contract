@@ -87,13 +87,30 @@ Only the stored admin address may call this function.
 | Function | Contract | Why |
 |----------|----------|-----|
 | `revoke` | Registry | Prevents unauthorised removal of profiles |
-| `verify_profile` | Registry | Controls verification status |
+| `reinstate` | Registry | Kept admin-only (not delegated to the verifier role, #732) |
+| `set_verifier`, `remove_verifier` | Registry | Assigning the verifier role is an admin decision (#732) |
 | `batch_register_issuers` | Registry | Batch operations gated by admin |
 | `set_pool_contract` | Invoice | Wiring a new pool changes fund flows |
 | `set_expiry_window` | Invoice | Configuration parameter |
 | `fund_invoice` | Pool | (*currently*) Capital allocation from pool |
 | `set_max_utilization` | Pool | Risk parameter |
 | `transfer_ownership` | All | Changes the admin key |
+
+### Pattern B2 — Admin-or-Verifier (`caller.require_auth()` + role check)
+
+`caller` must be the stored admin **or** the stored verifier
+(`DataKey::Verifier`), and must sign. Lets routine KYC decisions be delegated
+to an operational key without exposing admin powers (#732).
+
+| Function | Contract | Why |
+|----------|----------|-----|
+| `verify_profile` | Registry | Day-to-day verification; the verifier cannot transfer admin/ownership, pause, revoke, reinstate or reassign the role |
+
+> **Note:** `verify_profile(caller, address, false)` also marks a profile
+> revoked, so a verifier *can* un-verify a profile through this path. The
+> dedicated `revoke` / `reinstate` entry points (and their `address_revoked` /
+> `address_reinstated` events) stay admin-only, and the admin can remove a
+> misbehaving verifier at any time with `remove_verifier`.
 
 ### Pattern C — Cross-Contract Auth (`contract.require_auth()`)
 
@@ -124,7 +141,7 @@ Any account can call these.
 
 | Function | Contract | Notes |
 |----------|----------|-------|
-| `get_profile`, `is_verified`, `get_verification_status`, `get_admin` | Registry | Read-only views |
+| `get_profile`, `is_verified`, `get_verification_status`, `get_admin`, `get_verifier` | Registry | Read-only views |
 | `get`, `get_status`, `get_face_value`, `get_discount_bps`, `get_funding_asset`, `get_issuer`, `get_by_status`, `get_by_issuer`, `get_by_buyer`, `get_invoice_count_by_issuer`, `get_invoice_count_by_buyer`, `get_counts`, `get_expiry_window` | Invoice | Read-only views |
 | `get_locked`, `get_history` | Escrow | Read-only views |
 | `get_stats`, `get_lp_position`, `get_utilization_rate`, `get_usdc_asset` | Pool | Read-only views |

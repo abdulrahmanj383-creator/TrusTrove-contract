@@ -788,8 +788,8 @@ fn test_factory_pools_fund_and_repay_invoices_for_their_own_assets() {
     let metadata: Map<String, String> = Map::new(&te.env);
     registry.register_issuer(&issuer, &metadata);
     registry.register_buyer(&buyer, &metadata);
-    registry.verify_profile(&issuer, &true);
-    registry.verify_profile(&buyer, &true);
+    registry.verify_profile(&te.admin, &issuer, &true);
+    registry.verify_profile(&te.admin, &buyer, &true);
 
     for (asset, lp) in [(&asset_a, &lp_a), (&asset_b, &lp_b)] {
         let lp_key = TKey(lp.clone());
