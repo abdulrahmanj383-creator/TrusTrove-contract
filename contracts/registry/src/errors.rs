@@ -15,4 +15,7 @@ pub enum RegistryError {
     /// registration entry points. Pagination must be requested in bounded
     /// pages so a single call can never walk the whole index.
     PageSizeExceeded = 8,
+    /// The `caller` passed to `verify_profile` is neither the stored admin
+    /// nor the stored verifier (#732).
+    Unauthorized = 9,
 }

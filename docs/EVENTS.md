@@ -726,7 +726,37 @@ Emitted when a profile's verification status is checked/updated.
 | `topic[1]` | `Address` | Profile address |
 | **Data** | `bool` | Verification status (true = verified) |
 
-**Emitted by:** `verify_profile()` in `contracts/registry/src/lib.rs:570`
+**Emitted by:** `verify_profile()` in `contracts/registry/src/lib.rs` — callable by the admin or the verifier role (#732).
+
+---
+
+### `verifier_set`
+
+Emitted when the admin assigns (or replaces) the verifier role (#732).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Topics** | | |
+| `topic[0]` | `Symbol` | `"verifier_set"` |
+| `topic[1]` | `Address` | Admin that made the change |
+| **Data** | `Address` | New verifier |
+
+**Emitted by:** `set_verifier()` in `contracts/registry/src/lib.rs`
+
+---
+
+### `verifier_removed`
+
+Emitted when the admin clears the verifier role (#732).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Topics** | | |
+| `topic[0]` | `Symbol` | `"verifier_removed"` |
+| `topic[1]` | `Address` | Admin that made the change |
+| **Data** | `()` | — |
+
+**Emitted by:** `remove_verifier()` in `contracts/registry/src/lib.rs`
 
 ---
 

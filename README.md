@@ -211,7 +211,7 @@ symbol() → String                    ← set at initialize()
 
 The protocol employs a `pool_factory` + per-asset pool instance model. The `pool_factory` handles deploying and tracking an independent `pool_contract` instance for each supported funding asset (e.g., USDC, XLM). This design isolates risk, ensuring that a shortfall in one asset pool cannot cross-contaminate another. 
 
-**Note**: This architecture explicitly supersedes closed issue #17's Option A/B question, resolved as Option B (parallel single-asset pools instead of a commingled multi-asset pool).
+**Note**: This architecture explicitly supersedes closed issue #17's Option A/B question, resolved as Option B (parallel single-asset pools instead of a commingled multi-asset pool). The full rationale, storage layout, deploy flow and the remaining single-asset checklist are in [Pool Factory Design](./docs/POOL_FACTORY_DESIGN.md).
 
 ### Contract Interaction Map
 
@@ -259,7 +259,7 @@ Pool ──[shares]──► LP
 The issuer creates an invoice (recording `face_value`, `due_date`, `buyer`, `funding_asset`), then lists it with a `discount_bps` (between 0 and 5,000, representing 0% to 50% max yield) expressing the yield they will give up in exchange for immediate liquidity. If `discount_bps > 5000`, the transaction fails with `InvoiceError::DiscountTooHigh` (#9).
 
 
-Before listing, an Underwrite agent must sign an `AttestationPayload` (containing `domain_separator`, `invoice_id`, `risk_score`, `evidence_hash`, `agent_id`, `nonce`) off-chain with a secp256k1 key. Anyone can relay this signature via `submit_attestation`, which recovers the signer and verifies it against the agent-registry contract (deployed separately from the `underwrite-contract` repo). The agent-registry address is configured via `set_agent_registry_contract` (admin-only). `list_for_financing` panics with `VerificationRequired` until a valid attestation exists for the invoice.
+Before listing, an Underwrite agent must sign an `AttestationPayload` (containing `domain_separator`, `invoice_id`, `risk_score`, `evidence_hash`, `agent_id`, `nonce`) off-chain with a secp256k1 key. Anyone can relay this signature via `submit_attestation`, which recovers the signer and verifies it against the agent-registry contract (deployed separately from the `underwrite-contract` repo). The agent-registry address is configured via `set_agent_registry_contract` (admin-only). `list_for_financing` panics with `VerificationRequired` until a valid attestation exists for the invoice. The exact interface the agent-registry must implement, and the payload/signature scheme agents must sign, are specified in [Agent-Registry Interface](./docs/AGENT_REGISTRY_INTERFACE.md).
 
 ```
 No fund movement. Invoice status: Created → Listed.
@@ -504,6 +504,8 @@ Detailed references for contributors and integrators:
 - [Storage Schema](./docs/STORAGE.md) — on-chain data layout, TTL patterns, gas estimates
 - [Limitations](./docs/LIMITATIONS.md) — testnet constraints, known gaps, unhandled edge cases
 - [Event Catalog](./docs/EVENTS.md) — every emitted event, topics, data schema, and emitting contract
+- [Pool Factory Design](./docs/POOL_FACTORY_DESIGN.md) — per-asset pool factory (Option B), storage layout, deploy flow, single-asset checklist
+- [Agent-Registry Interface](./docs/AGENT_REGISTRY_INTERFACE.md) — `get_agent` / `Agent` spec and attestation signature scheme consumed by `submit_attestation`
 
 ### Key conventions
 

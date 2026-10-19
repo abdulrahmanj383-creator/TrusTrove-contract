@@ -14,7 +14,7 @@ use soroban_sdk::{
         storage::{Instance as _, Persistent as _},
         Address as _, Events as _, Ledger,
     },
-    vec, Address, Env, IntoVal, String, Symbol, TryFromVal, TryIntoVal, Val, Vec,
+    vec, Address, BytesN, Env, IntoVal, String, Symbol, TryFromVal, TryIntoVal, Val, Vec,
 };
 
 fn setup() -> (Env, RegistryContractClient<'static>) {
@@ -118,7 +118,7 @@ fn test_reinstate_before_initialize_panics() {
 #[should_panic(expected = "Error(Contract, #4)")]
 fn test_verify_profile_before_initialize_panics() {
     let (env, client) = setup();
-    client.verify_profile(&Address::generate(&env), &true);
+    client.verify_profile(&Address::generate(&env), &Address::generate(&env), &true);
 }
 
 #[test]
@@ -155,7 +155,7 @@ fn test_revoke_sets_verified_false() {
     let issuer = Address::generate(&env);
     client.register_issuer(&issuer, &map![&env]);
     assert!(!client.is_verified(&issuer));
-    client.verify_profile(&issuer, &true);
+    client.verify_profile(&admin, &issuer, &true);
     assert!(client.is_verified(&issuer));
     let result = client.revoke(&issuer);
     assert!(result);
@@ -240,7 +240,7 @@ fn test_re_register_revoked_issuer_panics() {
     let issuer = Address::generate(&env);
     client.register_issuer(&issuer, &map![&env]);
     assert!(!client.is_verified(&issuer));
-    client.verify_profile(&issuer, &true);
+    client.verify_profile(&admin, &issuer, &true);
     assert!(client.is_verified(&issuer));
     client.revoke(&issuer);
     assert!(!client.is_verified(&issuer));
@@ -257,14 +257,14 @@ fn test_reinstate_revoked_issuer_restores_verification() {
     let issuer = Address::generate(&env);
     client.register_issuer(&issuer, &map![&env]);
     assert!(!client.is_verified(&issuer));
-    client.verify_profile(&issuer, &true);
+    client.verify_profile(&admin, &issuer, &true);
     assert!(client.is_verified(&issuer));
 
     client.revoke(&issuer);
     assert!(!client.is_verified(&issuer));
 
     // Reinstate the revoked issuer via admin.verify_profile.
-    client.verify_profile(&issuer, &true);
+    client.verify_profile(&admin, &issuer, &true);
     assert!(client.is_verified(&issuer));
 }
 
@@ -278,7 +278,7 @@ fn test_reinstate_restores_verified_and_emits_event() {
     let issuer = Address::generate(&env);
     client.register_issuer(&issuer, &map![&env]);
     assert!(!client.is_verified(&issuer));
-    client.verify_profile(&issuer, &true);
+    client.verify_profile(&admin, &issuer, &true);
     assert!(client.is_verified(&issuer));
 
     client.revoke(&issuer);
@@ -358,6 +358,50 @@ fn test_reinstate_unregistered_panics() {
     client.initialize(&admin);
     let unknown = Address::generate(&env);
     client.reinstate(&unknown);
+}
+
+#[test]
+fn test_reinstate_on_pending_profile_does_not_verify() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+
+    // The profile is Pending: never verified, never revoked. `reinstate` is
+    // the inverse of `revoke` and must not act as an undocumented alternate
+    // path to verify a Pending profile (#606).
+    let events_before = env.events().all().len();
+    let result = client.reinstate(&issuer);
+    assert!(result);
+    assert!(!client.is_verified(&issuer));
+    assert_eq!(
+        client.get_verification_status(&issuer),
+        VerificationStatus::Pending
+    );
+    // No `address_reinstated` event and no other emission: the call is a no-op.
+    assert_eq!(env.events().all().len(), events_before);
+}
+
+#[test]
+fn test_reinstate_on_verified_profile_is_idempotent_noop() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+    client.verify_profile(&admin, &issuer, &true);
+
+    // Already Verified (never revoked): reinstate must not rewrite storage or
+    // re-emit `address_reinstated`, mirroring `revoke`'s idempotency guard (#606).
+    let events_before = env.events().all().len();
+    assert!(client.reinstate(&issuer));
+    assert!(client.is_verified(&issuer));
+    assert_eq!(
+        client.get_verification_status(&issuer),
+        VerificationStatus::Verified
+    );
+    assert_eq!(env.events().all().len(), events_before);
 }
 
 #[test]
@@ -1051,7 +1095,7 @@ fn test_verify_profile_updates_status() {
     assert!(!client.is_verified(&issuer));
 
     // Verify
-    let result = client.verify_profile(&issuer, &true);
+    let result = client.verify_profile(&admin, &issuer, &true);
     assert!(result);
     assert!(client.is_verified(&issuer));
 
@@ -1060,12 +1104,12 @@ fn test_verify_profile_updates_status() {
     assert!(!client.is_verified(&issuer));
 
     // Re-verify
-    let result = client.verify_profile(&issuer, &true);
+    let result = client.verify_profile(&admin, &issuer, &true);
     assert!(result);
     assert!(client.is_verified(&issuer));
 
     // Un-verify again
-    let result2 = client.verify_profile(&issuer, &false);
+    let result2 = client.verify_profile(&admin, &issuer, &false);
     assert!(result2);
     assert!(!client.is_verified(&issuer));
 }
@@ -1077,7 +1121,7 @@ fn test_verify_profile_unknown_panics() {
     let admin = Address::generate(&env);
     client.initialize(&admin);
     let unknown = Address::generate(&env);
-    client.verify_profile(&unknown, &true);
+    client.verify_profile(&admin, &unknown, &true);
 }
 
 #[test]
@@ -1091,7 +1135,7 @@ fn test_verify_profile_wrong_auth_panics() {
 
     // Clear all mocked auths — a non-admin caller should be rejected
     env.set_auths(&[]);
-    client.verify_profile(&issuer, &true);
+    client.verify_profile(&admin, &issuer, &true);
 }
 
 #[test]
@@ -1113,7 +1157,7 @@ fn test_get_verification_status_verified() {
     client.initialize(&admin);
     let issuer = Address::generate(&env);
     client.register_issuer(&issuer, &map![&env]);
-    client.verify_profile(&issuer, &true);
+    client.verify_profile(&admin, &issuer, &true);
     assert_eq!(
         client.get_verification_status(&issuer),
         VerificationStatus::Verified
@@ -1127,7 +1171,7 @@ fn test_get_verification_status_revoked() {
     client.initialize(&admin);
     let issuer = Address::generate(&env);
     client.register_issuer(&issuer, &map![&env]);
-    client.verify_profile(&issuer, &true);
+    client.verify_profile(&admin, &issuer, &true);
     client.revoke(&issuer);
     assert_eq!(
         client.get_verification_status(&issuer),
@@ -1161,6 +1205,42 @@ fn test_get_verification_status_distinguishes_pending_from_unregistered() {
     );
 }
 
+// ============== GET_ROLE VIEW TESTS (#609) ==============
+
+#[test]
+fn test_get_role_returns_issuer_role() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+    // Decoded on-chain: no need to reverse-engineer packed_flags (#609).
+    assert_eq!(client.get_role(&issuer), Some(Role::Issuer));
+}
+
+#[test]
+fn test_get_role_returns_buyer_and_survives_verification_changes() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let buyer = Address::generate(&env);
+    client.register_buyer(&buyer, &map![&env]);
+    client.verify_profile(&admin, &buyer, &true);
+    assert_eq!(client.get_role(&buyer), Some(Role::Buyer));
+    client.revoke(&buyer);
+    // The role is stable across verification state changes.
+    assert_eq!(client.get_role(&buyer), Some(Role::Buyer));
+}
+
+#[test]
+fn test_get_role_unregistered_returns_none() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let unknown = Address::generate(&env);
+    assert_eq!(client.get_role(&unknown), None);
+}
+
 #[test]
 fn test_get_verification_status_revoked_distinct_from_pending() {
     let (env, client) = setup();
@@ -1172,7 +1252,7 @@ fn test_get_verification_status_revoked_distinct_from_pending() {
 
     client.register_issuer(&pending, &map![&env]);
     client.register_issuer(&revoked, &map![&env]);
-    client.verify_profile(&revoked, &true);
+    client.verify_profile(&admin, &revoked, &true);
     client.revoke(&revoked);
 
     assert_eq!(
@@ -1192,13 +1272,13 @@ fn test_get_verification_status_re_verified_returns_verified() {
     client.initialize(&admin);
     let issuer = Address::generate(&env);
     client.register_issuer(&issuer, &map![&env]);
-    client.verify_profile(&issuer, &true);
+    client.verify_profile(&admin, &issuer, &true);
     client.revoke(&issuer);
     assert_eq!(
         client.get_verification_status(&issuer),
         VerificationStatus::Revoked
     );
-    client.verify_profile(&issuer, &true);
+    client.verify_profile(&admin, &issuer, &true);
     assert_eq!(
         client.get_verification_status(&issuer),
         VerificationStatus::Verified
@@ -1393,7 +1473,7 @@ fn prop_revoke_always_sets_is_verified_false_and_status_revoked() {
                     client.register_issuer(&address, &metadata);
                 }
                 for _ in 0..verify_count {
-                    client.verify_profile(&address, &true);
+                    client.verify_profile(&admin, &address, &true);
                 }
                 client.revoke(&address);
                 prop_assert!(!client.is_verified(&address));
@@ -1455,14 +1535,14 @@ fn prop_re_verify_after_revoke_restores_verified_state() {
                 } else {
                     client.register_issuer(&address, &metadata);
                 }
-                client.verify_profile(&address, &true);
+                client.verify_profile(&admin, &address, &true);
                 for _ in 0..cycles {
                     client.revoke(&address);
                     prop_assert_eq!(
                         client.get_verification_status(&address),
                         VerificationStatus::Revoked
                     );
-                    client.verify_profile(&address, &true);
+                    client.verify_profile(&admin, &address, &true);
                     prop_assert!(client.is_verified(&address));
                     prop_assert_eq!(
                         client.get_verification_status(&address),
@@ -1784,7 +1864,7 @@ fn test_revoke_emits_event() {
     client.initialize(&admin);
     let issuer = Address::generate(&env);
     client.register_issuer(&issuer, &map![&env]);
-    client.verify_profile(&issuer, &true);
+    client.verify_profile(&admin, &issuer, &true);
 
     client.revoke(&issuer);
 
@@ -1831,7 +1911,7 @@ fn test_get_profile_extends_ttl() {
     client.register_issuer(&issuer, &map![&env]);
     // New profiles start unverified (#130) — verify so the read below
     // exercises a fully-registered profile.
-    client.verify_profile(&issuer, &true);
+    client.verify_profile(&admin, &issuer, &true);
 
     let contract_id = client.address.clone();
     let key = DataKey::Profile(issuer.clone());
@@ -1876,7 +1956,7 @@ fn test_is_verified_extends_ttl() {
     let issuer = Address::generate(&env);
     client.register_issuer(&issuer, &map![&env]);
     // New profiles start unverified (#130) — verify so is_verified is true.
-    client.verify_profile(&issuer, &true);
+    client.verify_profile(&admin, &issuer, &true);
 
     let contract_id = client.address.clone();
     let key = DataKey::Profile(issuer.clone());
@@ -1925,7 +2005,7 @@ fn test_is_verified_does_not_extend_ttl_for_unknown() {
     let issuer = Address::generate(&env);
     client.register_issuer(&issuer, &map![&env]);
     // New profiles start unverified (#130) — verify before asserting.
-    client.verify_profile(&issuer, &true);
+    client.verify_profile(&admin, &issuer, &true);
     assert!(client.is_verified(&issuer));
 }
 
@@ -2536,4 +2616,287 @@ fn test_pause_is_scoped_to_one_instance() {
     let issuer = Address::generate(&env);
     assert!(a.try_register_issuer(&issuer, &map![&env]).is_err());
     assert!(b.register_issuer(&issuer, &map![&env]));
+}
+
+// ---------------------------------------------------------------------------
+// #732: secondary Verifier role for verify_profile
+// ---------------------------------------------------------------------------
+
+/// Registers a fresh registry with an admin, a verifier and one unverified
+/// issuer, using `mock_all_auths` for the setup calls only.
+fn setup_with_verifier() -> (
+    Env,
+    Address,
+    RegistryContractClient<'static>,
+    Address,
+    Address,
+    Address,
+) {
+    let (env, client) = setup();
+    let contract_id = client.address.clone();
+    let admin = Address::generate(&env);
+    let verifier = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    client.initialize(&admin);
+    client.set_verifier(&verifier);
+    client.register_issuer(&issuer, &map![&env]);
+    (env, contract_id, client, admin, verifier, issuer)
+}
+
+#[test]
+fn test_set_verifier_stores_and_emits_event() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    assert_eq!(client.get_verifier(), None);
+
+    let verifier = Address::generate(&env);
+    client.set_verifier(&verifier);
+    assert_eq!(client.get_verifier(), Some(verifier.clone()));
+
+    let last = env.events().all().last().unwrap();
+    assert_eq!(
+        vec![&env, last],
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (Symbol::new(&env, "verifier_set"), admin.clone()).into_val(&env),
+                verifier.into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn test_verifier_can_verify_and_unverify_profile() {
+    let (env, contract_id, client, _admin, verifier, issuer) = setup_with_verifier();
+
+    // Only the verifier signs — the admin's auth is never provided.
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &verifier,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "verify_profile",
+            args: (verifier.clone(), issuer.clone(), true).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.verify_profile(&verifier, &issuer, &true));
+    assert!(client.is_verified(&issuer));
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &verifier,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "verify_profile",
+            args: (verifier.clone(), issuer.clone(), false).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.verify_profile(&verifier, &issuer, &false));
+    assert!(!client.is_verified(&issuer));
+}
+
+#[test]
+fn test_admin_can_still_verify_when_verifier_set() {
+    let (_env, _contract_id, client, admin, _verifier, issuer) = setup_with_verifier();
+    assert!(client.verify_profile(&admin, &issuer, &true));
+    assert!(client.is_verified(&issuer));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_verify_profile_rejects_caller_that_is_neither_admin_nor_verifier() {
+    let (env, _contract_id, client, _admin, _verifier, issuer) = setup_with_verifier();
+    let stranger = Address::generate(&env);
+    // Even with all auths mocked, an unrecognised caller is rejected.
+    client.verify_profile(&stranger, &issuer, &true);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_verify_profile_rejects_non_admin_when_no_verifier_set() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+    client.verify_profile(&Address::generate(&env), &issuer, &true);
+}
+
+#[test]
+fn test_verify_profile_as_verifier_requires_verifier_signature() {
+    let (env, contract_id, client, admin, verifier, issuer) = setup_with_verifier();
+
+    // Naming the verifier as caller while only the admin signs must fail:
+    // the role check passes but `caller.require_auth()` does not.
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "verify_profile",
+            args: (verifier.clone(), issuer.clone(), true).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client
+        .try_verify_profile(&verifier, &issuer, &true)
+        .is_err());
+    assert!(!client.is_verified(&issuer));
+}
+
+#[test]
+fn test_verifier_cannot_call_transfer_admin() {
+    let (env, contract_id, client, admin, verifier, _issuer) = setup_with_verifier();
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &verifier,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "transfer_admin",
+            args: (verifier.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_transfer_admin(&verifier).is_err());
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_verifier_cannot_call_transfer_ownership() {
+    let (env, contract_id, client, admin, verifier, _issuer) = setup_with_verifier();
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &verifier,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "transfer_ownership",
+            args: (verifier.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_transfer_ownership(&verifier).is_err());
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_verifier_cannot_reassign_or_remove_verifier_role() {
+    let (env, contract_id, client, _admin, verifier, _issuer) = setup_with_verifier();
+    let other = Address::generate(&env);
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &verifier,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "set_verifier",
+            args: (other.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_set_verifier(&other).is_err());
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &verifier,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "remove_verifier",
+            args: Vec::<Val>::new(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_remove_verifier().is_err());
+    assert_eq!(client.get_verifier(), Some(verifier));
+}
+
+#[test]
+fn test_verifier_cannot_revoke_or_reinstate() {
+    let (env, contract_id, client, admin, verifier, issuer) = setup_with_verifier();
+    client.verify_profile(&admin, &issuer, &true);
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &verifier,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "revoke",
+            args: (issuer.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_revoke(&issuer).is_err());
+    assert!(client.is_verified(&issuer));
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &verifier,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "reinstate",
+            args: (issuer.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_reinstate(&issuer).is_err());
+}
+
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_set_verifier_by_non_admin_panics() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    env.set_auths(&[]);
+    client.set_verifier(&Address::generate(&env));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_set_verifier_before_initialize_panics() {
+    let (env, client) = setup();
+    client.set_verifier(&Address::generate(&env));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_removed_verifier_can_no_longer_verify() {
+    let (_env, _contract_id, client, _admin, verifier, issuer) = setup_with_verifier();
+    client.remove_verifier();
+    assert_eq!(client.get_verifier(), None);
+    client.verify_profile(&verifier, &issuer, &true);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_replaced_verifier_loses_role() {
+    let (env, _contract_id, client, _admin, old_verifier, issuer) = setup_with_verifier();
+    let new_verifier = Address::generate(&env);
+    client.set_verifier(&new_verifier);
+    assert!(client.verify_profile(&new_verifier, &issuer, &true));
+    client.verify_profile(&old_verifier, &issuer, &true);
+}
+
+#[test]
+fn test_verifier_survives_admin_transfer() {
+    let (env, _contract_id, client, _admin, verifier, issuer) = setup_with_verifier();
+    let new_admin = Address::generate(&env);
+    client.transfer_admin(&new_admin);
+    // The role is independent of who the admin is.
+    assert_eq!(client.get_verifier(), Some(verifier.clone()));
+    assert!(client.verify_profile(&verifier, &issuer, &true));
+}
+
+#[test]
+#[should_panic(expected = "Error(Auth")]
+fn test_upgrade_requires_admin_auth() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    env.set_auths(&[]);
+    client.upgrade(&BytesN::from_array(&env, &[0; 32]));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_upgrade_before_initialize_panics() {
+    let (env, client) = setup();
+    client.upgrade(&BytesN::from_array(&env, &[0; 32]));
 }
